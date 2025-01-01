@@ -9,6 +9,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const volumeValue = document.querySelector('.volume-value');
 
   let isRunning = false;
+  let currentTab = null;
 
   // 檢查當前運行狀態
   chrome.runtime.sendMessage({ action: 'getState' }, (response) => {
@@ -45,137 +46,151 @@ document.addEventListener('DOMContentLoaded', () => {
     testBtn.disabled = running;
   }
 
-  // 確保音訊系統已初始化
-  async function ensureAudioReady() {
-    return new Promise((resolve) => {
-      chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
-        if (!tabs[0]) {
-          alert('請先打開一個網頁再開始');
-          resolve(false);
-          return;
-        }
+  // 獲取當前標籤
+  async function getCurrentTab() {
+    if (currentTab) {
+      try {
+        // 檢查標籤是否還存在
+        await chrome.tabs.get(currentTab.id);
+        return currentTab;
+      } catch (e) {
+        currentTab = null;
+      }
+    }
 
-        if (tabs[0].url.startsWith('chrome://') || tabs[0].url.startsWith('chrome-extension://')) {
-          alert('請在一般網頁上開始（不能在 Chrome 內部頁面上運行）');
-          resolve(false);
-          return;
-        }
+    const tabs = await chrome.tabs.query({active: true, currentWindow: true});
+    if (tabs[0]) {
+      currentTab = tabs[0];
+      return currentTab;
+    }
+    return null;
+  }
 
-        // 發送測試音效
-        chrome.tabs.sendMessage(tabs[0].id, {
-          action: 'test',
-          volume: 0 // 音量設為0，用戶聽不到
-        }).then(() => {
-          resolve(true);
-        }).catch((error) => {
-          if (error.message.includes('Could not establish connection')) {
-            // 如果連接失敗，嘗試重新注入 content script
-            chrome.scripting.executeScript({
-              target: { tabId: tabs[0].id },
-              files: ['content.js']
-            }).then(() => {
-              setTimeout(() => {
-                chrome.tabs.sendMessage(tabs[0].id, {
-                  action: 'test',
-                  volume: 0
-                }).then(() => resolve(true));
-              }, 100);
-            }).catch(() => {
-              alert('無法在當前頁面運行，請嘗試重新載入頁面或在其他網頁上開始');
-              resolve(false);
-            });
-          } else {
-            alert('初始化失敗，請嘗試重新載入頁面');
-            resolve(false);
-          }
-        });
+  // 初始化音訊系統
+  async function initAudioSystem() {
+    const tab = await getCurrentTab();
+    if (!tab) {
+      throw new Error('找不到可用的標籤頁');
+    }
+
+    if (tab.url.startsWith('chrome://') || tab.url.startsWith('chrome-extension://')) {
+      throw new Error('無法在 Chrome 內部頁面上運行');
+    }
+
+    try {
+      // 嘗試初始化音訊系統
+      await chrome.tabs.sendMessage(tab.id, {
+        action: 'initAudio'
       });
-    });
+      return true;
+    } catch (error) {
+      if (error.message.includes('Could not establish connection')) {
+        // 注入 content script
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['content.js']
+        });
+        
+        // 等待腳本加載
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+        // 重試初始化
+        await chrome.tabs.sendMessage(tab.id, {
+          action: 'initAudio'
+        });
+        return true;
+      }
+      throw error;
+    }
   }
 
   // 開始按鈕
   startBtn.addEventListener('click', async () => {
-    // 先確保音訊系統已準備就緒
-    const isReady = await ensureAudioReady();
-    if (!isReady) return;
+    try {
+      // 初始化音訊系統
+      await initAudioSystem();
+      
+      const tab = await getCurrentTab();
+      if (!tab) return;
 
-    const message = {
-      action: 'start',
-      totalTime: parseInt(totalTimeInput.value),
-      volume: parseInt(volumeInput.value)
-    };
-    chrome.runtime.sendMessage(message, (response) => {
-      if (response && response.success) {
-        isRunning = true;
-        updateButtonStates(true);
-      }
-    });
+      // 發送開始消息到當前標籤
+      await chrome.tabs.sendMessage(tab.id, {
+        action: 'playMetronome',
+        volume: parseInt(volumeInput.value)
+      });
+
+      // 發送到 background
+      chrome.runtime.sendMessage({
+        action: 'start',
+        totalTime: parseInt(totalTimeInput.value),
+        volume: parseInt(volumeInput.value)
+      }, (response) => {
+        if (response && response.success) {
+          isRunning = true;
+          updateButtonStates(true);
+        }
+      });
+    } catch (error) {
+      console.error('啟動失敗:', error);
+      alert(error.message || '啟動失敗，請重試');
+    }
   });
 
   // 暫停按鈕
-  pauseBtn.addEventListener('click', () => {
-    chrome.runtime.sendMessage({ action: 'pause' }, (response) => {
-      if (response && response.success) {
-        isRunning = false;
-        updateButtonStates(false);
+  pauseBtn.addEventListener('click', async () => {
+    try {
+      const tab = await getCurrentTab();
+      if (tab) {
+        await chrome.tabs.sendMessage(tab.id, { action: 'stop' });
       }
-    });
+
+      chrome.runtime.sendMessage({ action: 'pause' }, (response) => {
+        if (response && response.success) {
+          isRunning = false;
+          updateButtonStates(false);
+        }
+      });
+    } catch (error) {
+      console.error('暫停失敗:', error);
+    }
   });
 
   // 重置按鈕
-  resetBtn.addEventListener('click', () => {
-    chrome.runtime.sendMessage({ action: 'reset' }, (response) => {
-      if (response && response.success) {
-        isRunning = false;
-        updateButtonStates(false);
-        updateDisplay(0);
+  resetBtn.addEventListener('click', async () => {
+    try {
+      const tab = await getCurrentTab();
+      if (tab) {
+        await chrome.tabs.sendMessage(tab.id, { action: 'stop' });
       }
-    });
+
+      chrome.runtime.sendMessage({ action: 'reset' }, (response) => {
+        if (response && response.success) {
+          isRunning = false;
+          updateButtonStates(false);
+          updateDisplay(0);
+        }
+      });
+    } catch (error) {
+      console.error('重置失敗:', error);
+    }
   });
 
   // 測試按鈕
-  testBtn.addEventListener('click', () => {
-    // 先獲取當前活動標籤
-    chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
-      if (!tabs[0]) {
-        alert('請先打開一個網頁再進行測試');
-        return;
-      }
+  testBtn.addEventListener('click', async () => {
+    try {
+      await initAudioSystem();
+      
+      const tab = await getCurrentTab();
+      if (!tab) return;
 
-      // 檢查是否是 Chrome 內部頁面
-      if (tabs[0].url.startsWith('chrome://') || tabs[0].url.startsWith('chrome-extension://')) {
-        alert('請在一般網頁上進行測試（不能在 Chrome 內部頁面上測試）');
-        return;
-      }
-
-      // 發送測試消息
-      chrome.tabs.sendMessage(tabs[0].id, {
+      await chrome.tabs.sendMessage(tab.id, {
         action: 'test',
         volume: parseInt(volumeInput.value)
-      }).catch((error) => {
-        if (error.message.includes('Could not establish connection')) {
-          // 如果連接失敗，嘗試重新注入 content script
-          chrome.scripting.executeScript({
-            target: { tabId: tabs[0].id },
-            files: ['content.js']
-          }).then(() => {
-            // 重新嘗試發送消息
-            setTimeout(() => {
-              chrome.tabs.sendMessage(tabs[0].id, {
-                action: 'test',
-                volume: parseInt(volumeInput.value)
-              });
-            }, 100);
-          }).catch((error) => {
-            alert('無法在當前頁面執行測試，請嘗試重新載入頁面或在其他網頁上測試');
-            console.error('腳本注入失敗:', error);
-          });
-        } else {
-          alert('測試失敗，請嘗試重新載入頁面');
-          console.error('測試消息發送失敗:', error);
-        }
       });
-    });
+    } catch (error) {
+      console.error('測試失敗:', error);
+      alert(error.message || '測試失敗，請重試');
+    }
   });
 
   // 監聽來自 background 的更新
@@ -202,13 +217,20 @@ document.addEventListener('DOMContentLoaded', () => {
     chrome.storage.local.set({ totalTime: totalTimeInput.value });
   });
 
-  volumeInput.addEventListener('change', () => {
+  volumeInput.addEventListener('change', async () => {
     chrome.storage.local.set({ volume: volumeInput.value });
     if (isRunning) {
-      chrome.runtime.sendMessage({
-        action: 'updateVolume',
-        volume: parseInt(volumeInput.value)
-      });
+      try {
+        const tab = await getCurrentTab();
+        if (tab) {
+          await chrome.tabs.sendMessage(tab.id, {
+            action: 'updateVolume',
+            volume: parseInt(volumeInput.value)
+          });
+        }
+      } catch (error) {
+        console.error('音量更新失敗:', error);
+      }
     }
   });
 }); 

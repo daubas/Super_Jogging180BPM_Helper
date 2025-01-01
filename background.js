@@ -1,215 +1,236 @@
-let timer = null;
-let currentTime = 0;
-let totalTime = 30 * 60; // 預設30分鐘
-let isRunning = false;
-let volume = 50;
-let metronomeInterval = null;
-let activeTabId = null;
-let lastBeatTime = 0;
-let nextBeatTime = 0;
+class BackgroundController {
+  // 私有屬性
+  #timer = null;
+  #currentTime = 0;
+  #totalTime = 30 * 60; // 預設30分鐘
+  #isRunning = false;
+  #volume = 50;
+  #metronomeInterval = null;
+  #nextBeatTime = 0;
+  #activeTabs = new Set();
 
-// 追蹤所有開啟的標籤頁
-let activeTabs = new Set();
+  constructor() {
+    this.#setupListeners();
+  }
 
-// 更新活動標籤
-function updateActiveTab() {
-  chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
+  // 設置所有監聽器
+  #setupListeners() {
+    // 標籤頁監聽
+    chrome.tabs.onActivated.addListener(() => this.#updateActiveTab());
+    chrome.tabs.onUpdated.addListener(this.#handleTabUpdate.bind(this));
+    chrome.tabs.onRemoved.addListener(this.#handleTabRemove.bind(this));
+
+    // 消息監聽
+    chrome.runtime.onMessage.addListener(this.#handleMessage.bind(this));
+  }
+
+  // 更新活動標籤
+  async #updateActiveTab() {
+    const tabs = await chrome.tabs.query({active: true, currentWindow: true});
     if (tabs[0]) {
-      activeTabId = tabs[0].id;
+      await this.#syncStateToTab(tabs[0].id);
     }
-  });
-}
+  }
 
-// 初始化監聽器
-chrome.tabs.onActivated.addListener(updateActiveTab);
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status === 'complete') {
-    // 將新標籤加入追蹤列表
-    activeTabs.add(tabId);
-    
-    // 如果正在運行，向新標籤發送當前狀態
-    if (isRunning) {
-      chrome.tabs.sendMessage(tabId, {
+  // 處理標籤更新
+  async #handleTabUpdate(tabId, changeInfo) {
+    if (changeInfo.status === 'complete') {
+      this.#activeTabs.add(tabId);
+      if (this.#isRunning) {
+        await this.#syncStateToTab(tabId);
+      }
+    }
+  }
+
+  // 處理標籤移除
+  #handleTabRemove(tabId) {
+    this.#activeTabs.delete(tabId);
+  }
+
+  // 同步狀態到指定標籤
+  async #syncStateToTab(tabId) {
+    try {
+      await chrome.tabs.sendMessage(tabId, {
         action: 'syncState',
-        isRunning: isRunning,
-        currentTime: currentTime,
-        volume: volume
-      }).catch(() => {
-        // 忽略錯誤
+        isRunning: this.#isRunning,
+        currentTime: this.#currentTime,
+        volume: this.#volume
       });
+    } catch (error) {
+      // 忽略錯誤，標籤可能已關閉
+      this.#activeTabs.delete(tabId);
     }
   }
-});
 
-// 監聽標籤關閉
-chrome.tabs.onRemoved.addListener((tabId) => {
-  activeTabs.delete(tabId);
-});
-
-// 安全地發送消息到所有標籤
-function broadcastMessage(message) {
-  activeTabs.forEach(tabId => {
-    chrome.tabs.sendMessage(tabId, message).catch(() => {
-      // 如果發送失敗，從列表中移除該標籤
-      activeTabs.delete(tabId);
+  // 廣播消息到所有活動標籤
+  async #broadcastMessage(message) {
+    const promises = Array.from(this.#activeTabs).map(async (tabId) => {
+      try {
+        await chrome.tabs.sendMessage(tabId, message);
+      } catch (error) {
+        this.#activeTabs.delete(tabId);
+      }
     });
-  });
-}
-
-// 180BPM 節拍器
-function setupMetronome() {
-  // 清除現有的節拍器
-  if (metronomeInterval) {
-    clearInterval(metronomeInterval);
-    metronomeInterval = null;
+    await Promise.allSettled(promises);
   }
 
-  // 計算 180BPM 的間隔（毫秒）
-  const interval = Math.floor(60000 / 180); // 333.33ms
-  nextBeatTime = Date.now();
+  // 設置節拍器
+  #setupMetronome() {
+    // 清除現有的節拍器
+    if (this.#metronomeInterval) {
+      clearInterval(this.#metronomeInterval);
+      this.#metronomeInterval = null;
+    }
 
-  // 播放聲音的函數
-  function playBeat() {
-    if (!isRunning) return;
+    // 計算 180BPM 的間隔（毫秒）
+    const interval = Math.floor(60000 / 180); // 333.33ms
+    this.#nextBeatTime = Date.now();
 
-    const now = Date.now();
-    if (now >= nextBeatTime) {
-      broadcastMessage({
-        action: 'playMetronome',
-        volume: volume
-      });
-      
-      // 計算下一拍的時間
-      while (nextBeatTime <= now) {
-        nextBeatTime += interval;
+    // 播放聲音的函數
+    const playBeat = () => {
+      if (!this.#isRunning) return;
+
+      const now = Date.now();
+      if (now >= this.#nextBeatTime) {
+        this.#broadcastMessage({
+          action: 'playMetronome',
+          volume: this.#volume
+        });
+        
+        // 計算下一拍的時間
+        while (this.#nextBeatTime <= now) {
+          this.#nextBeatTime += interval;
+        }
       }
+    };
+
+    // 使用較短的間隔來檢查，以提高精確度
+    this.#metronomeInterval = setInterval(playBeat, 10);
+    
+    // 立即播放第一個音
+    playBeat();
+
+    // 每分鐘重新同步一次，防止時間漂移
+    setInterval(() => {
+      if (this.#isRunning) {
+        this.#nextBeatTime = Date.now() + interval;
+      }
+    }, 60000);
+  }
+
+  // 開始計時
+  #startTimer() {
+    if (!this.#timer) {
+      this.#updateActiveTab(); // 確保我們有最新的活動標籤
+      this.#timer = setInterval(() => {
+        this.#currentTime++;
+        
+        // 每5分鐘提示
+        if (this.#currentTime % 300 === 0) {
+          this.#broadcastMessage({
+            action: 'showTimeNotification',
+            time: this.#currentTime
+          });
+        }
+        
+        // 更新 popup
+        chrome.runtime.sendMessage({
+          action: 'updateTimer',
+          time: this.#currentTime
+        }).catch(() => {
+          // 忽略 popup 關閉時的錯誤
+        });
+        
+        // 檢查是否完成
+        if (this.#currentTime >= this.#totalTime) {
+          this.#stopTimer();
+          this.#broadcastMessage({
+            action: 'completed',
+            time: this.#currentTime
+          });
+        }
+      }, 1000);
     }
   }
 
-  // 使用較短的間隔來檢查，以提高精確度
-  metronomeInterval = setInterval(playBeat, 10);
-  
-  // 立即播放第一個音
-  playBeat();
-
-  // 每分鐘重新同步一次，防止時間漂移
-  setInterval(() => {
-    if (isRunning) {
-      nextBeatTime = Date.now() + interval;
+  // 停止計時
+  #stopTimer() {
+    if (this.#timer) {
+      clearInterval(this.#timer);
+      this.#timer = null;
     }
-  }, 60000);
-}
+    if (this.#metronomeInterval) {
+      clearInterval(this.#metronomeInterval);
+      this.#metronomeInterval = null;
+    }
+    this.#isRunning = false;
+    
+    // 通知所有標籤頁停止
+    this.#broadcastMessage({
+      action: 'stop'
+    });
+  }
 
-// 開始計時
-function startTimer() {
-  if (!timer) {
-    updateActiveTab(); // 確保我們有最新的活動標籤
-    timer = setInterval(() => {
-      currentTime++;
-      
-      // 每5分鐘提示
-      if (currentTime % 300 === 0) {
-        broadcastMessage({
-          action: 'showTimeNotification',
-          time: currentTime
+  // 處理接收到的消息
+  #handleMessage(request, sender, sendResponse) {
+    switch (request.action) {
+      case 'getState':
+        sendResponse({
+          isRunning: this.#isRunning,
+          currentTime: this.#currentTime,
+          volume: this.#volume,
+          totalTime: Math.floor(this.#totalTime / 60)
         });
-      }
-      
-      // 更新 popup
-      chrome.runtime.sendMessage({
-        action: 'updateTimer',
-        time: currentTime
-      }).catch(() => {
-        // 忽略 popup 關閉時的錯誤
-      });
-      
-      // 檢查是否完成
-      if (currentTime >= totalTime) {
-        stopTimer();
-        broadcastMessage({
-          action: 'completed',
-          time: currentTime
-        });
-      }
-    }, 1000);
-  }
-}
+        break;
 
-// 停止計時
-function stopTimer() {
-  if (timer) {
-    clearInterval(timer);
-    timer = null;
-  }
-  if (metronomeInterval) {
-    clearInterval(metronomeInterval);
-    metronomeInterval = null;
-  }
-  isRunning = false;
-  
-  // 通知所有標籤頁停止
-  broadcastMessage({
-    action: 'stop'
-  });
-}
-
-// 監聽來自 popup 的消息
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  switch (request.action) {
-    case 'getState':
-      sendResponse({
-        isRunning,
-        currentTime,
-        volume,
-        totalTime: Math.floor(totalTime / 60)
-      });
-      break;
-
-    case 'start':
-      if (!isRunning) {
-        totalTime = request.totalTime * 60;
-        volume = request.volume;
-        isRunning = true;
-        nextBeatTime = Date.now();
-        setupMetronome();
-        startTimer();
+      case 'start':
+        if (!this.#isRunning) {
+          this.#totalTime = request.totalTime * 60;
+          this.#volume = request.volume;
+          this.#isRunning = true;
+          this.#nextBeatTime = Date.now();
+          this.#setupMetronome();
+          this.#startTimer();
+          
+          // 通知所有標籤頁開始
+          this.#broadcastMessage({
+            action: 'syncState',
+            isRunning: true,
+            currentTime: this.#currentTime,
+            volume: this.#volume
+          });
+          
+          sendResponse({ success: true });
+        }
+        break;
         
-        // 通知所有標籤頁開始
-        broadcastMessage({
-          action: 'syncState',
-          isRunning: true,
-          currentTime: currentTime,
-          volume: volume
-        });
-        
+      case 'pause':
+        this.#stopTimer();
         sendResponse({ success: true });
-      }
-      break;
-      
-    case 'pause':
-      stopTimer();
-      sendResponse({ success: true });
-      break;
-      
-    case 'reset':
-      stopTimer();
-      currentTime = 0;
-      sendResponse({ success: true });
-      break;
+        break;
+        
+      case 'reset':
+        this.#stopTimer();
+        this.#currentTime = 0;
+        sendResponse({ success: true });
+        break;
 
-    case 'updateVolume':
-      volume = request.volume;
-      if (isRunning) {
-        // 音量變更不需要重新設置節拍器
-        broadcastMessage({
-          action: 'syncState',
-          isRunning: true,
-          currentTime: currentTime,
-          volume: volume
-        });
-      }
-      sendResponse({ success: true });
-      break;
+      case 'updateVolume':
+        this.#volume = request.volume;
+        if (this.#isRunning) {
+          this.#broadcastMessage({
+            action: 'syncState',
+            isRunning: true,
+            currentTime: this.#currentTime,
+            volume: this.#volume
+          });
+        }
+        sendResponse({ success: true });
+        break;
+    }
+    return true; // 保持消息通道開啟
   }
-  return true; // 保持消息通道開啟
-}); 
+}
+
+// 創建控制器實例
+const backgroundController = new BackgroundController(); 
