@@ -1,63 +1,322 @@
-// 音訊上下文和音效緩存
+// 音訊系統
 let audioContext = null;
-let clickBuffer = null;
+let metronomeNode = null;
+let isMetronomeRunning = false;
+
+// 清理音訊系統
+async function cleanupAudioSystem() {
+  isMetronomeRunning = false;
+  if (metronomeNode) {
+    metronomeNode.disconnect();
+    metronomeNode = null;
+  }
+  if (audioContext) {
+    await audioContext.close();
+    audioContext = null;
+  }
+}
+
+// 創建視覺化節拍指示器
+function createBeatVisualizer() {
+  const visualizer = document.createElement('div');
+  visualizer.id = 'beat-visualizer';
+  visualizer.style.cssText = `
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    width: 20px;
+    height: 20px;
+    background: rgba(76, 175, 80, 0.8);
+    border-radius: 50%;
+    z-index: 999999;
+    display: none;
+    transition: transform 0.1s, background-color 0.1s;
+  `;
+  document.body.appendChild(visualizer);
+  return visualizer;
+}
+
+let beatVisualizer = null;
+let isVisualizerActive = false;
+
+// 初始化視覺元素
+function initializeVisualElements() {
+  if (!beatVisualizer) {
+    beatVisualizer = createBeatVisualizer();
+  }
+}
+
+// 更新視覺化顯示
+function updateVisualizerDisplay(show = true) {
+  if (!beatVisualizer) {
+    initializeVisualElements();
+  }
+  
+  beatVisualizer.style.display = show ? 'block' : 'none';
+  isVisualizerActive = show;
+}
+
+// 視覺化節拍
+function visualizeBeat(isHighPitch = true) {
+  if (!isVisualizerActive || !beatVisualizer) return;
+  
+  // 根據高低音變化顏色
+  const color = isHighPitch ? 'rgba(76, 175, 80, 0.8)' : 'rgba(33, 150, 243, 0.8)';
+  
+  beatVisualizer.style.transform = 'scale(1.2)';
+  beatVisualizer.style.backgroundColor = color;
+  
+  setTimeout(() => {
+    if (isVisualizerActive) {
+      beatVisualizer.style.transform = 'scale(1)';
+    }
+  }, 100);
+}
 
 // 初始化音訊系統
-async function initAudioSystem() {
+async function initAudioSystem(isTest = false) {
   try {
-    if (!audioContext) {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    // 檢查瀏覽器支援
+    if (!window.AudioContext && !window.webkitAudioContext) {
+      throw new Error('瀏覽器不支援 AudioContext');
+    }
+
+    // 檢查現有系統並確保清理
+    await cleanupAudioSystem();
+    
+    // 等待一小段時間確保完全清理
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    // 創建新的音訊上下文
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    
+    // 等待音訊上下文初始化
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    // 確保音訊上下文已啟動
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume();
+    }
+
+    // 檢查 AudioWorklet 支援
+    if (!audioContext.audioWorklet) {
+      throw new Error('瀏覽器不支援 AudioWorklet');
+    }
+
+    try {
+      // 載入 AudioWorklet
+      const workletUrl = chrome.runtime.getURL('metronome-processor.js');
+      await audioContext.audioWorklet.addModule(workletUrl);
       
-      // 預加載音效
-      const response = await fetch(chrome.runtime.getURL('assets/click.mp3'));
-      const arrayBuffer = await response.arrayBuffer();
-      clickBuffer = await audioContext.decodeAudioData(arrayBuffer);
+      // 等待 AudioWorklet 加載完成
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // 創建節點
+      metronomeNode = new AudioWorkletNode(audioContext, 'metronome-processor', {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        processorOptions: {
+          sampleRate: audioContext.sampleRate
+        }
+      });
+      
+      // 確保節點創建成功
+      if (!metronomeNode) {
+        throw new Error('無法創建 AudioWorkletNode');
+      }
+      
+      // 連接節點
+      metronomeNode.connect(audioContext.destination);
+      
+      // 設置消息處理
+      metronomeNode.port.onmessage = (event) => {
+        if (event.data.type === 'beat') {
+          visualizeBeat(event.data.isHighPitch);
+        }
+      };
+
+      // 設置默認音量
+      try {
+        const volumeParam = metronomeNode.parameters.get('volume');
+        if (volumeParam) {
+          volumeParam.setValueAtTime(0.5, audioContext.currentTime);
+        }
+      } catch (error) {
+        console.warn('設置默認音量失敗:', error);
+      }
+
+      return true;
+    } catch (error) {
+      console.error('AudioWorklet 初始化失敗:', error);
+      await cleanupAudioSystem();
+      throw error;
+    }
+  } catch (error) {
+    console.error('音訊系統初始化失敗:', error);
+    
+    if (!isTest) {
+      if (error.name === 'NotAllowedError') {
+        showStatusNotification('請先與頁面互動以啟用音訊');
+      } else if (error.name === 'NotSupportedError' || error.message.includes('不支援')) {
+        showStatusNotification('瀏覽器不支援所需的音訊功能');
+      } else {
+        showStatusNotification('音訊系統初始化失敗，請重試');
+      }
     }
     
-    // 如果音訊上下文被暫停，嘗試恢復
-    if (audioContext.state === 'suspended') {
+    await cleanupAudioSystem();
+    return false;
+  }
+}
+
+// 確保在用戶互動後初始化
+document.addEventListener('click', async () => {
+  try {
+    if (!audioContext) {
+      await initAudioSystem();
+    } else if (audioContext.state === 'suspended') {
       await audioContext.resume();
     }
   } catch (error) {
     console.error('音訊系統初始化失敗:', error);
   }
+}, { once: true });
+
+// 倒數計時
+async function countdown(seconds) {
+  // 通知 background 倒數開始，暫停計時
+  chrome.runtime.sendMessage({ action: 'countdownStarted' });
+
+  const countdownOverlay = document.createElement('div');
+  countdownOverlay.style.cssText = `
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: rgba(0, 0, 0, 0.8);
+    color: white;
+    font-size: 48px;
+    font-weight: bold;
+    padding: 40px;
+    border-radius: 50%;
+    width: 100px;
+    height: 100px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 999999;
+    opacity: 0;
+    transition: opacity 0.3s, transform 0.3s;
+  `;
+  document.body.appendChild(countdownOverlay);
+
+  for (let i = seconds; i > 0; i--) {
+    countdownOverlay.textContent = i;
+    countdownOverlay.style.opacity = '1';
+    countdownOverlay.style.transform = 'translate(-50%, -50%) scale(1)';
+    
+    await new Promise(resolve => setTimeout(resolve, 800));
+    
+    countdownOverlay.style.opacity = '0';
+    countdownOverlay.style.transform = 'translate(-50%, -50%) scale(0.8)';
+    
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+
+  countdownOverlay.textContent = '開始';
+  countdownOverlay.style.opacity = '1';
+  countdownOverlay.style.transform = 'translate(-50%, -50%) scale(1.2)';
+  
+  await new Promise(resolve => setTimeout(resolve, 800));
+  
+  countdownOverlay.style.opacity = '0';
+  countdownOverlay.style.transform = 'translate(-50%, -50%) scale(0.8)';
+  
+  await new Promise(resolve => setTimeout(resolve, 200));
+  
+  document.body.removeChild(countdownOverlay);
+
+  // 通知 background 倒數結束，開始計時
+  chrome.runtime.sendMessage({ action: 'countdownCompleted' });
 }
 
-// 確保頁面加載時初始化音訊系統
-document.addEventListener('DOMContentLoaded', initAudioSystem);
-
-// 用戶互動時確保音訊系統啟動
-document.addEventListener('click', initAudioSystem);
-
 // 播放節拍器聲音
-async function playMetronomeSound(volume) {
+async function startMetronome(volume, skipCountdown = false) {
   try {
-    // 確保音訊系統已初始化
-    await initAudioSystem();
+    // 如果已經在運行，先停止
+    if (isMetronomeRunning) {
+      stopMetronome();
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    // 初始化音訊系統
+    const initialized = await initAudioSystem();
+    if (!initialized) {
+      throw new Error('音訊系統初始化失敗');
+    }
     
-    if (audioContext && clickBuffer) {
-      const source = audioContext.createBufferSource();
-      const gainNode = audioContext.createGain();
-      
-      source.buffer = clickBuffer;
-      gainNode.gain.value = volume / 100;
-      
-      source.connect(gainNode);
-      gainNode.connect(audioContext.destination);
-      
-      source.start(0);
+    // 確保音訊系統就緒
+    if (!audioContext || !metronomeNode) {
+      throw new Error('音訊系統未就緒');
+    }
+    
+    // 確保音訊上下文處於運行狀態
+    if (audioContext.state !== 'running') {
+      await audioContext.resume();
+    }
+    
+    // 只在首次啟動時進行倒數
+    if (!skipCountdown) {
+      await countdown(3);
+    } else {
+      // 如果跳過倒數，直接通知開始計時
+      chrome.runtime.sendMessage({ action: 'countdownCompleted' });
+    }
+    
+    updateVisualizerDisplay(true);
+    
+    // 設置音量
+    try {
+      const volumeParam = metronomeNode.parameters.get('volume');
+      if (volumeParam) {
+        volumeParam.setValueAtTime(volume / 100, audioContext.currentTime);
+      } else {
+        console.warn('無法設置音量參數');
+      }
+    } catch (error) {
+      console.warn('設置音量失敗:', error);
+    }
+    
+    // 標記為運行中
+    isMetronomeRunning = true;
+    
+    // 開始播放
+    try {
+      metronomeNode.port.postMessage({
+        type: 'start',
+        volume: volume / 100
+      });
+    } catch (error) {
+      console.error('啟動播放失敗:', error);
+      throw error;
     }
   } catch (error) {
-    console.error('播放音效失敗:', error);
-    
-    // 如果 Web Audio API 失敗，嘗試使用傳統的 Audio API
-    try {
-      const sound = new Audio(chrome.runtime.getURL('assets/click.mp3'));
-      sound.volume = volume / 100;
-      await sound.play();
-    } catch (fallbackError) {
-      console.error('備用音效播放也失敗:', fallbackError);
-    }
+    console.error('節拍器啟動失敗:', error);
+    showStatusNotification('節拍器啟動失敗，請重試');
+    isMetronomeRunning = false;
+    await cleanupAudioSystem();
+  }
+}
+
+// 停止節拍器
+function stopMetronome() {
+  if (metronomeNode) {
+    metronomeNode.port.postMessage({
+      type: 'stop'
+    });
+    updateVisualizerDisplay(false);
+    isMetronomeRunning = false;
   }
 }
 
@@ -146,30 +405,67 @@ function showStatusNotification(message) {
 // 監聽來自 background 的消息
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   switch (request.action) {
+    case 'initAudio':
+      // 確保在初始化前清理
+      cleanupAudioSystem().then(() => {
+        return initAudioSystem(true);
+      }).then(() => {
+        sendResponse(true);
+      }).catch((error) => {
+        console.error('音訊系統初始化失敗:', error);
+        sendResponse(false);
+      });
+      return true;
+      
     case 'showTimeNotification':
       showTimeNotification(request.time);
       break;
+      
     case 'completed':
       showCompletionNotification(request.time);
+      stopMetronome();
       break;
+      
     case 'playMetronome':
-      playMetronomeSound(request.volume);
+      // 確保停止所有現有的播放
+      cleanupAudioSystem().then(async () => {
+        // 檢查是否為暫停後重啟
+        const wasRunning = isMetronomeRunning;
+        await startMetronome(request.volume, wasRunning);
+      });
       break;
+      
     case 'test':
-      // 測試功能
-      showFullscreenNotification('測試提示', 3000);
-      playMetronomeSound(request.volume || 50);
+      // 確保停止所有現有的播放
+      cleanupAudioSystem().then(async () => {
+        showStatusNotification('測試模式');
+        await startMetronome(request.volume || 50, false);
+        setTimeout(() => {
+          stopMetronome();
+          showStatusNotification('測試完成');
+        }, 4000);
+      });
       break;
+      
     case 'syncState':
-      // 同步狀態
       if (request.isRunning) {
-        showStatusNotification('計時器正在運行中');
-        // 確保音訊系統已啟動
-        initAudioSystem();
+        startMetronome(request.volume, true);
+      } else {
+        stopMetronome();
       }
       break;
+      
     case 'stop':
-      showStatusNotification('計時器已停止');
+      stopMetronome();
+      break;
+      
+    case 'updateVolume':
+      if (metronomeNode) {
+        const volumeParam = metronomeNode.parameters.get('volume');
+        if (volumeParam) {
+          volumeParam.setValueAtTime(request.volume / 100, audioContext.currentTime);
+        }
+      }
       break;
   }
 }); 

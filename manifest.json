@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Super Jogging 180BPM Helper",
+  "name": "超慢跑追劇助手",
   "version": "1.0",
-  "description": "協助超慢跑訓練的 Chrome 擴展程式",
+  "description": "協助超慢跑訓練的 Chrome 擴展程式，讓您在追劇時也能保持正確的步頻",
   "permissions": [
     "storage",
     "tabs",
@@ -16,17 +16,25 @@
     "default_popup": "popup.html"
   },
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "js": ["content-script.js"],
       "run_at": "document_start"
     }
   ],
   "web_accessible_resources": [{
-    "resources": ["assets/*"],
+    "resources": [
+      "assets/*",
+      "metronome-processor.js",
+      "audioSystem.js",
+      "visualSystem.js",
+      "timerSystem.js",
+      "controller.js"
+    ],
     "matches": ["<all_urls>"]
   }]
 } 
